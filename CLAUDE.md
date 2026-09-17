@@ -1,8 +1,50 @@
-# TradingView MCP — Claude Instructions
+# CLAUDE.md
 
-84 tools for reading and controlling a live TradingView Desktop chart via CDP (port 9222).
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Decision Tree — Which Tool When
+## What this is
+
+A vendored clone of the upstream [tradesdontlie/tradingview-mcp](https://github.com/tradesdontlie/tradingview-mcp) — an MCP server + CLI that lets Claude read and control a locally-running TradingView Desktop app via Chrome DevTools Protocol (CDP). 84 tools, one `tv` CLI mirror. Not affiliated with TradingView Inc. or Anthropic (see README Disclaimer); requires a real TradingView subscription and does not touch TradingView's servers or bypass any paywall.
+
+This is a fork/patch of upstream, not a from-scratch project — prefer fixing bugs upstream over silently diverging locally, and use the built-in `tv_update` tool / `npm run` equivalent to pull `origin/main` rather than hand-merging.
+
+## Commands
+
+```bash
+npm install                    # deps: @modelcontextprotocol/sdk + chrome-remote-interface only
+npm run lint                   # eslint src/
+npm run test:unit              # cli/pine_analyze/sanitization/replay/launch/chart_*/update tests — no TradingView needed
+npm run test:e2e               # requires TradingView Desktop running with --remote-debugging-port=9222
+npm test                       # e2e + pine_analyze
+node --test tests/cli.test.js  # run a single test file directly
+npm link                       # optional: expose the `tv` CLI globally
+```
+
+CI (`.github/workflows/`) runs on Node 20.x/22.x: `npm run lint`, then `npm run test:unit` (e2e is excluded there since it needs a live desktop app), then a non-blocking `npm audit --audit-level=high`.
+
+Launching TradingView with CDP enabled (prerequisite for e2e tests and for using any tool against a real chart): `scripts/launch_tv_debug_mac.sh` / `_linux.sh` / `launch_tv_debug.bat`, or the `tv_launch` MCP tool / `tv launch` CLI command — see the MSIX gotcha below for Windows Store installs.
+
+## Codebase architecture
+
+Three front-ends share one business-logic layer:
+
+- **`src/core/*.js`** — one file per domain (chart, data, pine, health, capture, drawing, replay, alerts, batch, watchlist, indicators, ui). Pure async functions; every one reaches TradingView through `evaluate()` in `src/connection.js`, which runs a JS string inside the live TradingView Electron window over CDP and returns the result.
+- **`src/tools/*.js`** — thin MCP wrappers: a zod schema + `jsonResult()` per tool, one `register*Tools(server)` per domain, all called from `src/server.js`. The MCP server's `instructions` field (in `server.js`) embeds its own condensed copy of the tool-selection guide below — update both if the tool set changes.
+- **`src/cli/*`** — the same core functions exposed as `tv <command>` subcommands through a zero-dependency router (`node:util.parseArgs`, see `router.js`); every MCP tool has a matching CLI command with JSON output for scripting outside Claude.
+
+`src/connection.js` holds the single CDP connection: `getClient()`/`connect()` with retry/backoff, `evaluate()`/`evaluateAsync()` to run JS in the page, and `KNOWN_PATHS` — internal, undocumented TradingView object paths (`window.TradingViewApi._activeChartWidgetWV`, etc.) found by live probing (`tv_discover`), not any public API. These can break on any TradingView update.
+
+Runtime: `Claude Code ←(stdio)→ MCP Server ←(CDP, localhost:9222)→ TradingView Desktop (Electron)`. Pine-drawing reads (`data_get_pine_*`) walk `study._graphics._primitivesCollection.dwglines.get('lines').get(false)._primitivesDataById` on the page object directly.
+
+**Windows MSIX gotcha** (`src/core/health.js` `launch()`): TradingView's Windows build now ships only as an MSIX/Store package, and Windows blocks the debug port when launched directly from `WindowsApps` (spawn succeeds but CDP never binds, or the process never starts). The workaround copies the package once to `%LOCALAPPDATA%\tradingview-mcp\<pkgName>` and launches that copy instead. **Known bug, confirmed on at least one install**: the auto-detect (both `health.js` and `scripts\launch_tv_debug.bat`) looks up `Get-AppxPackage -Name 'TradingView.Desktop'`, but this Store listing's actual `Name` is `31178TradingViewInc.TradingView` — auto-detect finds nothing until this is fixed upstream or `Get-AppxPackage -Name "*TradingView*"` is used instead.
+
+`tv_update` (`src/core/update.js`) does a fast-forward-only `git fetch`+pull of `origin/main` plus `npm ci` when `package.json` changed; refuses on a dirty working tree, a non-`main` branch, or diverged history rather than forcing.
+
+## Tool usage guide
+
+(Also embedded, in condensed form, in the running MCP server's own `instructions` — see `src/server.js`.)
+
+### Decision Tree — Which Tool When
 
 ### "What's on my chart right now?"
 1. `chart_get_state` → symbol, timeframe, chart type, list of all indicators with entity IDs
@@ -84,7 +126,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `tv_launch` → auto-detect and launch TradingView with CDP on Mac/Win/Linux
 - `tv_health_check` → verify connection is working
 
-## Context Management Rules
+### Context Management Rules
 
 These tools can return large payloads. Follow these rules to avoid context bloat:
 
@@ -97,7 +139,7 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 7. **Call `chart_get_state` once** at the start to get entity IDs, then reference them — don't re-call repeatedly
 8. **Cap your OHLCV requests** — `count: 20` for quick analysis, `count: 100` for deeper work, `count: 500` only when specifically needed
 
-### Output Size Estimates (compact mode)
+#### Output Size Estimates (compact mode)
 | Tool | Typical Output |
 |------|---------------|
 | `quote_get` | ~200 bytes |
@@ -110,7 +152,7 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 | `data_get_ohlcv` (100 bars) | ~8 KB |
 | `capture_screenshot` | ~300 bytes (returns file path, not image data) |
 
-## Tool Conventions
+### Tool Conventions
 
 - All tools return `{ success: true/false, ... }`
 - Entity IDs (from `chart_get_state`) are session-specific — don't cache across sessions
@@ -119,11 +161,3 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 - Screenshots save to `screenshots/` directory with timestamps
 - OHLCV capped at 500 bars, trades at 20 per request
 - Pine labels capped at 50 per study by default (pass `max_labels` to override)
-
-## Architecture
-
-```
-Claude Code ←→ MCP Server (stdio) ←→ CDP (localhost:9222) ←→ TradingView Desktop (Electron)
-```
-
-Pine graphics path: `study._graphics._primitivesCollection.dwglines.get('lines').get(false)._primitivesDataById`
